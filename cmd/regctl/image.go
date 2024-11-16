@@ -61,6 +61,7 @@ type imageOpts struct {
 	labels          []string
 	mediaType       string
 	modOpts         []mod.Opts
+	output          string
 	platform        string
 	platforms       []string
 	quiet           bool
@@ -92,6 +93,7 @@ func NewImageCmd(rOpts *rootOpts) *cobra.Command {
 	cmd.AddCommand(newImageManifestCmd(rOpts))
 	cmd.AddCommand(newImageModCmd(rOpts))
 	cmd.AddCommand(newImageRateLimitCmd(rOpts))
+	cmd.AddCommand(newImageSaveCmd(rOpts))
 	return cmd
 }
 
@@ -107,7 +109,7 @@ func newImageCheckBaseCmd(rOpts *rootOpts) *cobra.Command {
 If the base name is not provided, annotations will be checked in the image.
 If the digest is available, this checks if that matches the base name.
 If the digest is not available, layers of each manifest are compared.
-If the layers match, the config (history and roots) are optionally compared.	
+If the layers match, the config (history and roots) are optionally compared.
 If the base image does not match, the command exits with a non-zero status.`,
 		Example: `
 # report if base image has changed using annotations
@@ -997,6 +999,29 @@ regctl image ratelimit alpine --format '{{.Remain}}'`,
 	return cmd
 }
 
+func newImageSaveCmd(rOpts *rootOpts) *cobra.Command {
+	opts := imageOpts{
+		rootOpts: rOpts,
+	}
+	cmd := &cobra.Command{
+		Use:   "save <image_ref> [image_ref...]",
+		Short: "save images, same as \"image export\" for multiple images",
+		Long: `Exports an image into a tar file that can be later loaded into a docker engine with
+"docker load". The tar file is output to stdout by default if stdout is not a terminal.
+Compression is typically not useful since layers are already compressed.`,
+		Example: `
+# export an image
+regctl image save registry.example.org/repo:v1 >image-v1.tar`,
+		Args:              cobra.MinimumNArgs(1),
+		ValidArgsFunction: rOpts.completeArgTag,
+		RunE:              opts.runImageSave,
+	}
+	cmd.Flags().BoolVar(&opts.exportCompress, "compress", false, "Compress output with gzip")
+	cmd.Flags().StringVarP(&opts.output, "output", "o", "", "Output file (default is to stdout)")
+	cmd.Flags().StringVarP(&opts.platform, "platform", "p", "", "Specify platform (e.g. linux/amd64 or local)")
+	return cmd
+}
+
 func imageParseOptTime(s string) (mod.OptTime, map[string]string, error) {
 	ot := mod.OptTime{}
 	otherFields := map[string]string{}
@@ -1728,6 +1753,60 @@ func (opts *imageOpts) runImageRateLimit(cmd *cobra.Command, args []string) erro
 	}
 
 	return template.Writer(cmd.OutOrStdout(), opts.format, manifest.GetRateLimit(m))
+}
+
+func (opts *imageOpts) runImageSave(cmd *cobra.Command, args []string) error {
+	if opts.output == "" && ascii.IsWriterTerminal(cmd.OutOrStdout()) {
+		return fmt.Errorf("--output must be specified when writing to a terminal")
+	}
+	ctx := cmd.Context()
+	// dedup warnings
+	if w := warning.FromContext(ctx); w == nil {
+		ctx = warning.NewContext(ctx, &warning.Warning{Hook: warning.DefaultHook()})
+	}
+	var err error
+	var w io.Writer
+	if opts.output != "" {
+		w, err = os.Create(opts.output)
+		if err != nil {
+			return err
+		}
+	} else {
+		w = cmd.OutOrStdout()
+	}
+	refs := make([]ref.Ref, len(args))
+	for i, arg := range args {
+		refs[i], err = ref.New(arg)
+		if err != nil {
+			return err
+		}
+	}
+	rc := opts.rootOpts.newRegClient()
+	for i, r := range refs {
+		defer rc.Close(ctx, r)
+		if opts.platform != "" {
+			p, err := platform.Parse(opts.platform)
+			if err != nil {
+				return err
+			}
+			m, err := rc.ManifestGet(ctx, r, regclient.WithManifestPlatform(p))
+			if err != nil {
+				return err
+			}
+			refs[i].Digest = m.GetDescriptor().Digest.String()
+		}
+	}
+	iOpts := []regclient.ImageOpts{}
+	if opts.exportCompress {
+		iOpts = append(iOpts, regclient.ImageWithExportCompress())
+	}
+	imageRefs := make([]string, len(refs))
+	for i, r := range refs {
+		imageRefs[i] = r.CommonName()
+	}
+	opts.rootOpts.log.Debug("Image save",
+		slog.Any("refs", imageRefs))
+	return rc.ImageSave(ctx, refs, w, iOpts...)
 }
 
 type modFlagFunc struct {
